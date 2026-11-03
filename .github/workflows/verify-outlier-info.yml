@@ -1,0 +1,80 @@
+name: Verify outlier prediction diagnostics
+on:
+  push:
+    branches: [verify/outlier-prediction-info]
+permissions:
+  contents: read
+jobs:
+  focused-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 68515b837c4a347dbb7b60501eadaf428dbe5299
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            cleanlab
+            tests
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install -e ".[datalab]" -r requirements-test-core.txt black flake8
+      - name: Verify six baseline failures for missing diagnostics
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          source=cleanlab/datalab/internal/issue_manager/outlier.py
+          cp "$source" /tmp/outlier-fixed.py
+          trap 'cp /tmp/outlier-fixed.py "$source"' EXIT
+          git show 7506257:"$source" > "$source"
+          python -m mypy --install-types --non-interactive cleanlab > /tmp/mypy-baseline.txt 2>&1 || true
+          set +e
+          python -m pytest tests/datalab/issue_manager/test_outlier.py -k collect_pred_probs_info -q > /tmp/baseline.log 2>&1
+          status=$?
+          set -e
+          cp /tmp/outlier-fixed.py "$source"
+          cat /tmp/baseline.log
+          test "$status" -eq 1
+          grep -q "6 failed" /tmp/baseline.log
+          grep -q "KeyError: 'predicted_class'" /tmp/baseline.log
+      - name: Run outlier and info tests
+        run: python -m pytest tests/datalab/issue_manager/test_outlier.py tests/test_outlier.py tests/datalab/test_data_issues.py -q
+      - name: Check changed-file formatting and imports
+        run: |
+          python -m black --check --diff cleanlab/datalab/internal/issue_manager/outlier.py tests/datalab/issue_manager/test_outlier.py
+          python -m flake8 cleanlab/datalab/internal/issue_manager/outlier.py tests/datalab/issue_manager/test_outlier.py
+      - name: Compare type-check diagnostics with the unchanged baseline
+        shell: bash
+        run: |
+          python -m mypy --install-types --non-interactive cleanlab > /tmp/mypy-fixed.txt 2>&1 || true
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          def errors(path):
+              text = Path(path).read_text()
+              assert "Found " in text or "Success:" in text, text
+              return {re.sub(r":\d+(?::\d+)?:", ":LINE:", line) for line in text.splitlines() if ": error:" in line}
+          baseline = errors("/tmp/mypy-baseline.txt")
+          fixed = errors("/tmp/mypy-fixed.txt")
+          print(f"Baseline diagnostics: {len(baseline)}; patched diagnostics: {len(fixed)}")
+          extra = fixed - baseline
+          assert not extra, "\n".join(sorted(extra))
+          PY
+      - name: Run the PR usage example
+        run: |
+          python - <<'PY'
+          import numpy as np
+          from cleanlab import Datalab
+          lab = Datalab({"label": ["a", "a", "b", "b"]}, label_name="label")
+          lab.find_issues(
+              pred_probs=np.array([[0.9, 0.1], [0.8, 0.2], [0.1, 0.9], [0.45, 0.55]]),
+              issue_types={"outlier": {}},
+          )
+          info = lab.get_info("outlier")
+          assert info["predicted_class"] == [0, 0, 1, 1]
+          assert info["max_pred_probs"] == [0.9, 0.8, 0.9, 0.55]
+          print("PR usage example passed")
+          PY
